@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>姿态交接演练视窗 · Pose Handoff Lab</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <h1>姿态交接演练视窗</h1>
+        <span class="sub">动画控制 → 受力姿态</span>
+      </div>
+      <div class="hud">
+        <div class="hud-item"><label>模式</label><span id="mode" data-mode="animating">动画控制</span></div>
+        <div class="hud-item"><label>时间</label><span id="t-value">0.00</span><small>s</small></div>
+        <div class="hud-item"><label>受力骨骼</label><span id="owner-value">0 / 17</span></div>
+        <div class="hud-item"><label>审计</label><span id="audit" class="audit ok">所有权审计通过</span></div>
+      </div>
+    </header>
+
+    <main>
+      <section class="stage-wrap">
+        <canvas id="stage"></canvas>
+        <div class="stage-legend">
+          <span><i class="sw physics"></i>受力刚体</span>
+          <span><i class="sw anim"></i>动画驱动</span>
+          <span><i class="sw joint"></i>关节锚点</span>
+          <span><i class="sw contact"></i>接地接触</span>
+        </div>
+        <div id="failure" class="failure"></div>
+      </section>
+
+      <aside class="panel">
+        <div class="group">
+          <h2>场景</h2>
+          <div class="seg">
+            <button data-scenario="walk" class="active">行走中</button>
+            <button data-scenario="turn">转身中</button>
+            <button data-scenario="slope">斜面上</button>
+          </div>
+          <p id="scenario-desc" class="hint"></p>
+        </div>
+
+        <div class="group">
+          <h2>受力范围</h2>
+          <div class="seg">
+            <button data-subset="all" class="active">全身</button>
+            <button data-subset="upper">上半身</button>
+          </div>
+          <p id="subset-desc" class="hint"></p>
+        </div>
+
+        <div class="group">
+          <h2>步速</h2>
+          <div class="row">
+            <input id="speed" type="range" min="0.6" max="2.2" step="0.05" value="1.45" />
+            <span id="speed-label">1.45 m/s</span>
+          </div>
+          <label class="check"><input id="auto-handoff" type="checkbox" checked /> 到点自动触发受击</label>
+        </div>
+
+        <div class="group">
+          <h2>控制</h2>
+          <div class="btns">
+            <button id="strike" class="primary">受击并接手</button>
+            <button id="restore">恢复动画</button>
+            <button id="freeze">暂停</button>
+            <button id="reset">重置</button>
+          </div>
+        </div>
+
+        <div class="group">
+          <h2>可重放输入</h2>
+          <div class="btns">
+            <button id="record">开始录制</button>
+            <button id="export">导出回放</button>
+            <button id="replay">重放</button>
+            <label class="file">载入<input id="import" type="file" accept="application/json" /></label>
+          </div>
+          <p id="replay-state" class="hint">未录制</p>
+        </div>
+
+        <div class="group grow">
+          <h2>结果区</h2>
+          <div id="result" class="result"></div>
+        </div>
+
+        <p id="message" class="message"></p>
+      </aside>
+    </main>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
