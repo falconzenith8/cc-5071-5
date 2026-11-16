@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { SCENARIOS, ScenarioId } from '../core/animator';
+import { ObstacleSpec } from '../core/physics';
 import { Vec3 } from '../core/math';
 
 export class SceneView {
@@ -8,6 +9,7 @@ export class SceneView {
   camera: THREE.PerspectiveCamera;
   private ground: THREE.Mesh | null = null;
   private grid: THREE.GridHelper | null = null;
+  private obstacleGroup = new THREE.Group();
   private contactGroup = new THREE.Group();
   private contactPool: THREE.Mesh[] = [];
   private target = new THREE.Vector3();
@@ -42,6 +44,7 @@ export class SceneView {
     rim.position.set(-4, 2.5, -3);
     this.scene.add(rim);
 
+    this.scene.add(this.obstacleGroup);
     this.scene.add(this.contactGroup);
   }
 
@@ -100,6 +103,41 @@ export class SceneView {
     this.camera.position.set(sc.camera.pos.x, sc.camera.pos.y, sc.camera.pos.z);
     this.target.set(sc.camera.target.x, sc.camera.target.y, sc.camera.target.z);
     this.camera.lookAt(this.target);
+  }
+
+  /** Render the same fixed obstacles the physics world collides with. */
+  setObstacles(obstacles: ObstacleSpec[]): void {
+    this.clearObstacles();
+    for (const spec of obstacles) {
+      const geo = new THREE.BoxGeometry(
+        spec.halfExtents.x * 2,
+        spec.halfExtents.y * 2,
+        spec.halfExtents.z * 2,
+      );
+      const color = spec.kind === 'ceiling' ? 0x8a5a3c : 0x4a5d75;
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.8,
+        metalness: 0.05,
+        transparent: true,
+        opacity: 0.92,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(spec.center.x, spec.center.y, spec.center.z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.name = spec.id;
+      this.obstacleGroup.add(mesh);
+    }
+  }
+
+  clearObstacles(): void {
+    for (const child of [...this.obstacleGroup.children]) {
+      const mesh = child as THREE.Mesh;
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+      this.obstacleGroup.remove(mesh);
+    }
   }
 
   follow(target: Vec3, lead: Vec3, dt: number): void {

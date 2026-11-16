@@ -1,8 +1,10 @@
 import RAPIER from '@dimforge/rapier3d-compat';
 import { SCENARIOS, ScenarioId } from './core/animator';
-import { Simulator } from './core/simulator';
+import { Simulator, EnvironmentKind } from './core/simulator';
 import { HandoffSnapshot, describeSubset } from './core/physics';
 import { BONE_IDS, anchorErrors } from './core/rig';
+import { FallenOrientation } from './core/recoveryPoses';
+import { phaseLabel } from './core/recovery';
 import { CharacterView } from './view/CharacterView';
 import { SceneView } from './view/SceneView';
 import { parseReplay } from './core/replay';
@@ -26,6 +28,7 @@ sceneView.setScenario(sim.scenario);
 let lastSnapshot: HandoffSnapshot | null = null;
 let frozen = false;
 let failureBone: string | null = null;
+let fallOrientation: Exclude<FallenOrientation, 'upright'> = 'supine';
 
 // ---------------------------------------------------------------- UI rendering
 
@@ -85,9 +88,64 @@ const clearResult = (): void => {
   $('#result').innerHTML = `<p class="empty">尚未触发交接。点击「受击并接手」或等待自动触发。</p>`;
 };
 
+const renderRecovery = (): void => {
+  const panel = $('#recovery-panel');
+  const state = sim.getRecoveryState();
+  if (!state) {
+    panel.innerHTML = `<p class="empty">尚未开始恢复。先「受控倒地」，再「接触感知起身」。</p>`;
+    panel.classList.remove('failed', 'ok');
+    return;
+  }
+  const plan = state.plan;
+  if (!plan) {
+    panel.innerHTML = `<p class="empty">分析中…</p>`;
+    return;
+  }
+  const failed = state.status === 'failed';
+  panel.classList.toggle('failed', failed);
+  panel.classList.toggle('ok', state.status === 'complete');
+  const basisRows = plan.basis.reasons.map((r) => `<li>${r}</li>`).join('');
+  const clearanceRows = plan.phaseClearance
+    .map((c) => {
+      const avail = Number.isFinite(c.available) ? c.available.toFixed(2) : '充足';
+      const tight = Number.isFinite(c.available) && c.available < c.needed;
+      return `<tr class="${tight ? 'bad' : ''}"><td>${phaseLabel(c.phase)}</td><td>${c.needed.toFixed(2)}</td><td>${avail}</td></tr>`;
+    })
+    .join('');
+  const statusText: Record<string, string> = {
+    idle: '空闲',
+    analyzing: '分析中',
+    'getting-up': '起身中',
+    blending: '交回动画中',
+    paused: '已暂停（接触阻挡）',
+    failed: '不可恢复',
+    complete: '完成',
+  };
+  panel.innerHTML = `
+    <div class="recovery-head">
+      <span class="badge ${failed ? 'bad' : state.status === 'complete' ? 'good' : ''}">${statusText[state.status] ?? state.status}</span>
+      <span class="muted">${phaseLabel(state.phase)} ${(state.progress * 100).toFixed(0)}%</span>
+    </div>
+    <ul class="basis-list">${basisRows}</ul>
+    <table class="clearance-table">
+      <thead><tr><th>阶段</th><th>需要净空 m</th><th>实际 m</th></tr></thead>
+      <tbody>${clearanceRows}</tbody>
+    </table>
+    ${plan.blockingReasons.length ? `<ul class="fail-list">${plan.blockingReasons.map((r) => `<li>${r}</li>`).join('')}</ul>` : ''}
+    <p class="note">${state.message}</p>
+  `;
+};
+
+const MODE_LABELS: Record<string, string> = {
+  animating: '动画控制',
+  physics: '受力姿态',
+  falling: '受控倒地',
+  recovering: '接触恢复',
+};
+
 const updateHud = (): void => {
-  $('#mode').textContent = sim.mode === 'animating' ? '动画控制' : '受力姿态';
-  $('#mode').dataset.mode = sim.mode;
+  $('#mode').textContent = MODE_LABELS[sim.mode] ?? sim.mode;
+  $('#mode').dataset.mode = sim.mode === 'animating' ? 'animating' : 'physics';
   $('#t-value').textContent = sim.time.toFixed(2);
   const physCount = BONE_IDS.filter((id) => sim.ownership.get(id) === 'physics').length;
   $('#owner-value').textContent = `${physCount} / ${BONE_IDS.length}`;
@@ -168,6 +226,7 @@ const reset = (): void => {
   character.clearTrail();
   clearResult();
   $('#failure').classList.remove('show');
+  renderRecovery();
   updateHud();
 };
 
@@ -176,9 +235,11 @@ const wire = (): void => {
     el.addEventListener('click', () => {
       sim.setScenario(el.dataset.scenario as ScenarioId);
       sceneView.setScenario(sim.scenario);
+      sceneView.setObstacles(sim.handoff.getObstacles());
       character.clearTrail();
       lastSnapshot = null;
       clearResult();
+      renderRecovery();
       $('#failure').classList.remove('show');
       updateHud();
     });
@@ -206,6 +267,64 @@ const wire = (): void => {
   });
   $('#reset').addEventListener('click', reset);
   $('#freeze').addEventListener('click', () => setFrozen(!frozen));
+
+  for (const el of document.querySelectorAll<HTMLButtonElement>('[data-fall]')) {
+    el.addEventListener('click', () => {
+      fallOrientation = el.dataset.fall as Exclude<FallenOrientation, 'upright'>;
+      for (const b of document.querySelectorAll<HTMLButtonElement>('[data-fall]')) {
+        b.classList.toggle('active', b === el);
+      }
+    });
+  }
+  for (const el of document.querySelectorAll<HTMLButtonElement>('[data-env]')) {
+    el.addEventListener('click', () => {
+      const env = el.dataset.env as EnvironmentKind;
+      sim.setEnvironment(env);
+      sceneView.setObstacles(sim.handoff.getObstacles());
+      character.clearTrail();
+      lastSnapshot = null;
+      clearResult();
+      renderRecovery();
+      updateHud();
+      for (const b of document.querySelectorAll<HTMLButtonElement>('[data-env]')) {
+        b.classList.toggle('active', b === el);
+      }
+    });
+  }
+  $('#fall').addEventListener('click', () => {
+    if (sim.mode === 'recovering') {
+      sim.message('恢复进行中，无法再次倒地。');
+      updateHud();
+      return;
+    }
+    sim.fallDown(fallOrientation);
+    renderRecovery();
+    updateHud();
+  });
+  $('#recover').addEventListener('click', () => {
+    if (sim.mode === 'animating') {
+      sim.message('角色尚未倒地：先「受控倒地」或触发受击。');
+      updateHud();
+      return;
+    }
+    const plan = sim.beginRecovery();
+    renderRecovery();
+    if (!plan || !plan.feasible) {
+      $('#failure').classList.add('show');
+      $('#failure').innerHTML = `<strong>恢复不可行</strong>
+        <span>${plan?.blockingReasons.join('；') ?? '当前状态无法启动恢复'}</span>
+        <span>接触限制保持开启，角色不会穿过障碍。可调整环境后点「重新评估」。</span>`;
+    } else {
+      $('#failure').classList.remove('show');
+    }
+    updateHud();
+  });
+  $('#retry-recover').addEventListener('click', () => {
+    const plan = sim.retryRecovery();
+    renderRecovery();
+    if (plan?.feasible) $('#failure').classList.remove('show');
+    updateHud();
+  });
   ($('#auto-handoff') as HTMLInputElement).addEventListener('change', (e) => {
     sim.autoHandoff = (e.target as HTMLInputElement).checked;
     updateHud();
@@ -311,6 +430,7 @@ const frame = (now: number): void => {
   sceneView.showContacts(sim.handoff.contactPoints());
   $('#scenario-desc').textContent = SCENARIOS[sim.scenario].description;
   $('#subset-desc').textContent = describeSubset(sim.subset);
+  renderRecovery();
 
   const root = pose.pelvis.pos;
   sceneView.setCamera(
@@ -324,7 +444,9 @@ const frame = (now: number): void => {
 
 wire();
 sceneView.resize();
+sceneView.setObstacles(sim.handoff.getObstacles());
 clearResult();
+renderRecovery();
 updateHud();
 requestAnimationFrame(frame);
 
@@ -333,4 +455,5 @@ requestAnimationFrame(frame);
   sim,
   snapshot: () => lastSnapshot,
   failureBone: () => failureBone,
+  recovery: () => sim.getRecoveryState(),
 };

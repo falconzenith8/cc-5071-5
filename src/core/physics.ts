@@ -1,5 +1,5 @@
 import RAPIER from '@dimforge/rapier3d-compat';
-import { Quat, Vec3, qconj, qmul, qrot, vadd, vscale } from './math';
+import { Quat, Vec3, clamp, qconj, qmul, qnorm, qrot, qslerp, vadd, vdot, vlen, vnorm, vscale, vsub } from './math';
 import {
   BONES,
   BoneId,
@@ -16,6 +16,31 @@ import {
 import { SCENARIOS, ScenarioId, AnimSample, Animator } from './animator';
 
 export type Ownership = 'animation' | 'physics';
+
+/** Fixed environment geometry the recovery flow must work around. Collision stays on for the whole chain. */
+export interface ObstacleSpec {
+  id: string;
+  label: string;
+  kind: 'wall' | 'ceiling';
+  /** Cuboid center in world space. */
+  center: Vec3;
+  /** Cuboid half extents. */
+  halfExtents: Vec3;
+}
+
+/** Rays are cast against environment colliders only, never against the character's own chain. */
+export interface SpaceProbe {
+  origin: Vec3;
+  dir: Vec3;
+  maxToi: number;
+}
+
+export interface SpaceHit {
+  toi: number;
+  point: Vec3;
+  normal: Vec3;
+  obstacleId: string | null;
+}
 
 export interface BodyRecord {
   id: BoneId;
@@ -112,9 +137,11 @@ export const describeSubset = (subset: BoneId[]): string => {
 
 const GROUP_TERRAIN = 0x0001;
 const GROUP_CHARACTER = 0x0002;
-/** Character bones collide with terrain only: a self-colliding chain explodes at the seams. */
-const TERRAIN_GROUPS = (GROUP_TERRAIN << 16) | GROUP_CHARACTER;
-const CHARACTER_GROUPS = (GROUP_CHARACTER << 16) | GROUP_TERRAIN;
+const GROUP_OBSTACLE = 0x0004;
+/** Terrain and obstacles share the environment mask: the chain collides with both, never itself. */
+const ENV_GROUPS = GROUP_TERRAIN | GROUP_OBSTACLE;
+const TERRAIN_GROUPS = (ENV_GROUPS << 16) | GROUP_CHARACTER;
+const CHARACTER_GROUPS = (GROUP_CHARACTER << 16) | ENV_GROUPS;
 
 // Post-handoff stability assist. Tuned as an acceleration-level PD toward the
 // animated pose so body mass does not change the response. Kept deliberately
@@ -155,10 +182,13 @@ export class PoseHandoff {
   private animator: Animator;
   private scenario: ScenarioId;
   private terrainBody: RAPIER.RigidBody | null = null;
+  private obstacleBodies = new Map<string, { body: RAPIER.RigidBody; spec: ObstacleSpec }>();
+  private obstacles: ObstacleSpec[] = [];
 
-  constructor(scenario: ScenarioId, animator: Animator) {
+  constructor(scenario: ScenarioId, animator: Animator, obstacles: ObstacleSpec[] = []) {
     this.scenario = scenario;
     this.animator = animator;
+    this.obstacles = obstacles.map((o) => ({ ...o, center: { ...o.center }, halfExtents: { ...o.halfExtents } }));
     this.world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
     this.world.timestep = 1 / 120;
     // Joint chains under a full-character impact need more than the default 4
@@ -177,6 +207,7 @@ export class PoseHandoff {
     this.snapshot = null;
 
     this.buildTerrain();
+    this.buildObstacles();
 
     for (const id of BONE_IDS) {
       const pose = sample.pose[id];
@@ -290,6 +321,35 @@ export class PoseHandoff {
     );
   }
 
+  private buildObstacles(): void {
+    for (const rec of this.obstacleBodies.values()) this.world.removeRigidBody(rec.body);
+    this.obstacleBodies.clear();
+    for (const spec of this.obstacles) {
+      const body = this.world.createRigidBody(
+        RAPIER.RigidBodyDesc.fixed().setTranslation(spec.center.x, spec.center.y, spec.center.z),
+      );
+      this.world.createCollider(
+        RAPIER.ColliderDesc.cuboid(spec.halfExtents.x, spec.halfExtents.y, spec.halfExtents.z)
+          .setFriction(0.95)
+          .setRestitution(0.0)
+          .setCollisionGroups(TERRAIN_GROUPS),
+        body,
+      );
+      this.obstacleBodies.set(spec.id, { body, spec });
+    }
+  }
+
+  getObstacles(): ObstacleSpec[] {
+    return this.obstacles.map((o) => ({ ...o, center: { ...o.center }, halfExtents: { ...o.halfExtents } }));
+  }
+
+  /** Swap environment geometry and rebuild the fixed obstacle bodies immediately. */
+  setObstacles(obstacles: ObstacleSpec[]): void {
+    this.obstacles = obstacles.map((o) => ({ ...o, center: { ...o.center }, halfExtents: { ...o.halfExtents } }));
+    this.buildObstacles();
+    this.world.step();
+  }
+
   private clear(): void {
     for (const joint of this.joints.values()) if (joint.isValid()) this.world.removeImpulseJoint(joint, false);
     this.joints.clear();
@@ -300,6 +360,8 @@ export class PoseHandoff {
 
   dispose(): void {
     this.clear();
+    for (const rec of this.obstacleBodies.values()) this.world.removeRigidBody(rec.body);
+    this.obstacleBodies.clear();
     if (this.terrainBody) this.world.removeRigidBody(this.terrainBody);
     this.world.free();
   }
@@ -635,10 +697,269 @@ export class PoseHandoff {
     return pose;
   }
 
+  /**
+   * Ray cast against environment colliders (terrain + obstacles) only. The
+   * character's own colliders are excluded by collision groups, so a probe
+   * through an arm measures the room around the body, not the body itself.
+   */
+  castEnvironmentRay(probe: SpaceProbe): SpaceHit | null {
+    const dir = vnorm(probe.dir);
+    if (vlen(dir) < 1e-9) return null;
+    const ray = new RAPIER.Ray(probe.origin, dir);
+    // Rapier interaction groups (verified empirically): a candidate collider is
+    // reported when (queryMemberships & colliderFilter) != 0 AND
+    // (colliderMemberships & queryFilter) != 0. Environment colliders carry
+    // membership ENV_GROUPS with filter GROUP_CHARACTER, so the query must carry
+    // GROUP_CHARACTER membership while filtering for ENV_GROUPS. Character
+    // colliders (membership GROUP_CHARACTER) fail the second test and never hit.
+    const queryGroups = (GROUP_CHARACTER << 16) | ENV_GROUPS;
+    const hit = this.world.castRayAndGetNormal(ray, probe.maxToi, true, undefined, queryGroups);
+    if (!hit) return null;
+    const point = vadd(probe.origin, vscale(dir, hit.timeOfImpact));
+    let obstacleId: string | null = null;
+    for (const [id, rec] of this.obstacleBodies) {
+      if (rec.body.handle === hit.collider.parent()?.handle) obstacleId = id;
+    }
+    return { toi: hit.timeOfImpact, point, normal: { ...(hit.normal as Vec3) }, obstacleId };
+  }
+
+  /** Free-space distance above a world point; Infinity when nothing is hit within maxToi. */
+  clearanceAbove(point: Vec3, maxToi = 2.5): number {
+    const hit = this.castEnvironmentRay({ origin: point, dir: { x: 0, y: 1, z: 0 }, maxToi });
+    return hit ? hit.toi : Infinity;
+  }
+
+  /**
+   * Average outward normal of every terrain/obstacle contact on the chain,
+   * weighted by solver contact count. This is the actual support surface the
+   * recovery planner aligns to, not an assumed flat floor.
+   */
+  supportNormal(): { normal: Vec3; contactCount: number } {
+    const acc = { x: 0, y: 0, z: 0 };
+    let count = 0;
+    for (const id of BONE_IDS) {
+      const rec = this.records.get(id);
+      if (!rec) continue;
+      this.world.contactPairsWith(rec.collider, (other) => {
+        if (!this.isEnvironment(other)) return;
+        this.world.contactPair(rec.collider, other, (manifold) => {
+          if (manifold.numContacts() === 0) return;
+          // One contribution per contacting manifold pair, weighted by the
+          // manifold normal. Solver contacts can be zero during warm-up.
+          const n = manifold.normal();
+          acc.x += n.x;
+          acc.y += n.y;
+          acc.z += n.z;
+          count++;
+        });
+      });
+    }
+    if (count === 0) return { normal: { x: 0, y: 1, z: 0 }, contactCount: 0 };
+    return { normal: vnorm(acc), contactCount: count };
+  }
+
+  /** Contact normals per bone, including wall and ceiling pushes, for the recovery UI. */
+  contactNormalsByBone(): Map<BoneId, Vec3[]> {
+    const out = new Map<BoneId, Vec3[]>();
+    for (const id of BONE_IDS) {
+      const rec = this.records.get(id);
+      if (!rec) continue;
+      const normals: Vec3[] = [];
+      this.world.contactPairsWith(rec.collider, (other) => {
+        if (!this.isEnvironment(other)) return;
+        this.world.contactPair(rec.collider, other, (manifold) => {
+          if (manifold.numContacts() > 0) normals.push({ ...(manifold.normal() as Vec3) });
+        });
+      });
+      if (normals.length) out.set(id, normals);
+    }
+    return out;
+  }
+
+  private isEnvironment(collider: RAPIER.Collider): boolean {
+    const handle = collider.parent()?.handle;
+    if (this.terrainBody && handle === this.terrainBody.handle) return true;
+    for (const rec of this.obstacleBodies.values()) {
+      if (rec.body.handle === handle) return true;
+    }
+    return false;
+  }
+
+  /** Which obstacle (if any) currently has a solver contact with the chain. */
+  contactingObstacles(): string[] {
+    const ids = new Set<string>();
+    for (const id of BONE_IDS) {
+      const rec = this.records.get(id);
+      if (!rec) continue;
+      this.world.contactPairsWith(rec.collider, (other) => {
+        const handle = other.parent()?.handle;
+        for (const [obsId, obs] of this.obstacleBodies) {
+          if (obs.body.handle === handle) {
+            this.world.contactPair(rec.collider, other, (manifold) => {
+              if (manifold.numContacts() > 0) ids.add(obsId);
+            });
+          }
+        }
+      });
+    }
+    return [...ids];
+  }
+
+  /**
+   * Kinematic write of an externally authored pose (the guided-fall entry used
+   * by the recovery drill). All bodies stay in the same chain; joints are not
+   * rebuilt, so the skeleton hierarchy is untouched. One solver step is taken
+   * so contact manifolds exist against the new pose.
+   */
+  writePoseKinematic(pose: Pose): void {
+    for (const id of BONE_IDS) {
+      const rec = this.records.get(id);
+      if (!rec) continue;
+      if (!rec.body.isKinematic()) rec.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+      this.ownership.set(id, 'animation');
+      rec.body.setNextKinematicTranslation(pose[id].pos);
+      rec.body.setNextKinematicRotation(pose[id].rot);
+    }
+    this.world.step();
+  }
+
+  /**
+   * Blended kinematic target used while a get-up phase is in progress. Bodies
+   * are moved back to dynamic ownership and the caller applies bounded drives
+   * toward these targets; collision response always wins over the drive.
+   */
+  driveTowardPose(
+    target: Pose,
+    gains: { linK: number; linD: number; maxForce: number; angK: number; angD: number; maxTorque: number },
+    weight = 1,
+  ): void {
+    const dt = this.world.timestep;
+    for (const id of BONE_IDS) {
+      const rec = this.records.get(id);
+      if (!rec) continue;
+      if (rec.body.isKinematic()) rec.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+      this.ownership.set(id, 'physics');
+      const body = rec.body;
+      const mass = body.mass();
+      const pos = body.translation() as Vec3;
+      const vel = body.linvel() as Vec3;
+      const toTarget = vsub(target[id].pos, pos);
+      const force = {
+        x: (gains.linK * toTarget.x - gains.linD * vel.x) * mass * weight,
+        y: (gains.linK * toTarget.y - gains.linD * vel.y) * mass * weight,
+        z: (gains.linK * toTarget.z - gains.linD * vel.z) * mass * weight,
+      };
+      const forceMag = vlen(force);
+      if (forceMag > gains.maxForce) {
+        const s = gains.maxForce / forceMag;
+        force.x *= s; force.y *= s; force.z *= s;
+      }
+      body.applyImpulse(vscale(force, dt), true);
+
+      const rel = qnorm(qmul(target[id].rot, qconj(body.rotation() as Quat)));
+      const q = rel.w < 0 ? { x: -rel.x, y: -rel.y, z: -rel.z, w: -rel.w } : rel;
+      const angle = 2 * Math.atan2(Math.hypot(q.x, q.y, q.z), q.w);
+      if (angle > 1e-5) {
+        const axis = vnorm({ x: q.x, y: q.y, z: q.z });
+        const angVel = body.angvel() as Vec3;
+        const torqueMagRaw = gains.angK * angle;
+        const torque = {
+          x: (torqueMagRaw * axis.x - gains.angD * angVel.x) * mass * weight,
+          y: (torqueMagRaw * axis.y - gains.angD * angVel.y) * mass * weight,
+          z: (torqueMagRaw * axis.z - gains.angD * angVel.z) * mass * weight,
+        };
+        const torqueMag = vlen(torque);
+        if (torqueMag > gains.maxTorque) {
+          const s = gains.maxTorque / torqueMag;
+          torque.x *= s; torque.y *= s; torque.z *= s;
+        }
+        body.applyTorqueImpulse(vscale(torque, dt), true);
+      }
+    }
+  }
+
+  /** Per-bone distance from a target pose, for get-up phase progress checks. */
+  poseDeviation(target: Pose): { maxPos: number; maxRotDeg: number; rootPos: number } {    let maxPos = 0;
+    let maxRotDeg = 0;
+    const current = this.poseFromWorld();
+    for (const id of BONE_IDS) {
+      maxPos = Math.max(maxPos, vlen(vsub(current[id].pos, target[id].pos)));
+      const d = Math.abs(vdot(current[id].rot, target[id].rot));
+      maxRotDeg = Math.max(maxRotDeg, 2 * Math.acos(clamp(d, -1, 1)) * (180 / Math.PI));
+    }
+    return {
+      maxPos,
+      maxRotDeg,
+      rootPos: vlen(vsub(current[ROOT_ID].pos, target[ROOT_ID].pos)),
+    };
+  }
+
+  /**
+   * Guided fall: kinematically move the chain through an authored falling
+   * trajectory while the solver still generates real terrain/obstacle
+   * contacts each step. Used by the recovery drill to produce a deterministic
+   * supine/prone/side configuration without teleporting — every intermediate
+   * frame passes through the collision pipeline.
+   */
+  guidedFall(target: Pose, steps: number): void {
+    const start = this.poseFromWorld();
+    for (let s = 1; s <= steps; s++) {
+      const u = s / steps;
+      const eased = u * u * (3 - 2 * u);
+      const pose = {} as Pose;
+      for (const id of BONE_IDS) {
+        pose[id] = {
+          pos: {
+            x: start[id].pos.x + (target[id].pos.x - start[id].pos.x) * eased,
+            y: start[id].pos.y + (target[id].pos.y - start[id].pos.y) * eased,
+            z: start[id].pos.z + (target[id].pos.z - start[id].pos.z) * eased,
+          },
+          rot: qslerp(start[id].rot, target[id].rot, eased),
+        };
+      }
+      this.writePoseKinematic(pose);
+    }
+  }
+
+  /** Slurp helper kept here so recovery code never bypasses the normalized quaternion math. */
+  slerpRotation(from: Quat, to: Quat, t: number): Quat {
+    return qslerp(from, to, clamp(t, 0, 1));
+  }
+
   /** Returns simulation to animation control; the rig is rebuilt at the clip pose by the caller. */
   restoreAnimation(): void {
     this.active = false;
     this.snapshot = null;
+  }
+
+  /**
+   * Recovery entry: every chain body becomes dynamic at its current world pose
+   * with velocities zeroed. Nothing is teleported — the get-up drives start
+   * from exactly the fallen configuration the contacts describe.
+   */
+  beginDynamicRecovery(): void {
+    for (const id of BONE_IDS) {
+      const rec = this.records.get(id);
+      if (!rec) continue;
+      if (rec.body.isKinematic()) rec.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+      rec.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rec.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      rec.body.setGravityScale(1, true);
+      rec.body.setLinearDamping(0.15);
+      rec.body.setAngularDamping(0.6);
+      this.ownership.set(id, 'physics');
+    }
+  }
+
+  /** Restore default damping after the recovery blend hands control back to the clip. */
+  resetDamping(): void {
+    for (const id of BONE_IDS) {
+      const rec = this.records.get(id);
+      if (!rec) continue;
+      rec.body.setLinearDamping(0.06);
+      rec.body.setAngularDamping(0.3);
+      rec.body.setGravityScale(1, true);
+    }
   }
 
   /** Change which bones own physics without rebuilding (used only while inactive). */

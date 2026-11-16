@@ -1,29 +1,60 @@
 
-import { Animator, SCENARIOS, ScenarioId } from './animator';
-import { DEFAULT_SUBSET, PoseHandoff, HandoffSnapshot, UPPER_BODY_SUBSET } from './physics';
+import { Animator, AnimSample, SCENARIOS, ScenarioId } from './animator';
+import { DEFAULT_SUBSET, ObstacleSpec, PoseHandoff, HandoffSnapshot, UPPER_BODY_SUBSET } from './physics';
 import { BONE_IDS, BoneId, Pose } from './rig';
 import { Vec3 } from './math';
 import { Replay, emptyReplay, serializeReplay } from './replay';
+import { RecoveryController, RecoveryState, planRecovery } from './recovery';
+import { FallenOrientation, buildFallenPose } from './recoveryPoses';
 
-export type Mode = 'animating' | 'physics';
+export type Mode = 'animating' | 'physics' | 'falling' | 'recovering';
 export type SubsetKind = 'all' | 'upper';
+export type EnvironmentKind = 'clear' | 'wall' | 'ceiling';
 
 export interface SimulatorOptions {
   scenario?: ScenarioId;
   speed?: number;
   subset?: SubsetKind;
+  environment?: EnvironmentKind;
 }
 
 /**
  * Drives the drill. All controls talk to this object; the view only mirrors it.
  * The handoff core (PoseHandoff) owns the bodies, this owns the mode machine.
  */
+export const ENVIRONMENT_OBSTACLES: Record<Exclude<EnvironmentKind, 'clear'>, (root: Vec3) => ObstacleSpec[]> = {
+  // Low slab 0.5 m above the fallen pelvis: lying and tucking fit, standing
+  // headroom does not, so an in-place rise must be reported unrecoverable.
+  ceiling: (root) => [
+    {
+      id: 'low-ceiling',
+      label: '低顶',
+      kind: 'ceiling',
+      center: { x: root.x + 0.25, y: root.y + 0.5, z: root.z },
+      halfExtents: { x: 1.1, y: 0.06, z: 0.85 },
+    },
+  ],
+  // Wall just beyond the head in the facing (+X) direction, close enough that
+  // the planner's forward probe reports no room to unfold the rising torso.
+  // The anchor passed at drill time is the fallen head position (see fallDown).
+  wall: (root) => [
+    {
+      id: 'retaining-wall',
+      label: '挡墙',
+      kind: 'wall',
+      center: { x: root.x + 0.05, y: 0.45, z: root.z },
+      halfExtents: { x: 0.06, y: 0.6, z: 0.7 },
+    },
+  ],
+};
+
 export class Simulator {
   animator: Animator;
   handoff: PoseHandoff;
   scenario: ScenarioId;
   speed: number;
   subset: BoneId[];
+  environment: EnvironmentKind;
   mode: Mode = 'animating';
   time = 0;
   autoHandoff = true;
@@ -42,14 +73,25 @@ export class Simulator {
   /** The impulse used by the current run's handoff, so retries replay it verbatim. */
   lastImpact: { bone: BoneId; impulse: Vec3 } | null = null;
   lastMessage = '';
+  /** Contact-aware get-up state machine; null until a recovery is requested. */
+  recovery: RecoveryController | null = null;
+  /** Snapshot of the terminal recovery state, retained after control returns. */
+  private recoverySnapshot: RecoveryState | null = null;
 
   constructor(opts: SimulatorOptions = {}) {
     this.scenario = opts.scenario ?? 'walk';
     this.speed = opts.speed ?? SCENARIOS[this.scenario].suggestedSpeed;
     this.subset = opts.subset === 'upper' ? [...UPPER_BODY_SUBSET] : [...DEFAULT_SUBSET];
+    this.environment = opts.environment ?? 'clear';
     this.animator = new Animator(this.scenario, this.speed);
-    this.handoff = new PoseHandoff(this.scenario, this.animator);
+    this.handoff = new PoseHandoff(this.scenario, this.animator, this.environmentObstacles());
     this.handoff.build(this.animator.sample(0), this.subset);
+  }
+
+  private environmentObstacles(): ObstacleSpec[] {
+    if (this.environment === 'clear') return [];
+    const root = this.animator.sample(SCENARIOS[this.scenario].handoffTime).pose.pelvis.pos;
+    return ENVIRONMENT_OBSTACLES[this.environment](root);
   }
 
   dispose(): void {
@@ -76,6 +118,9 @@ export class Simulator {
     this.replayIndex = 0;
     this.inputLog = [];
     this.lastImpact = null;
+    this.recovery = null;
+    this.recoverySnapshot = null;
+    this.handoff.setObstacles(this.environmentObstacles());
     this.handoff.build(this.animator.sample(0), this.subset);
     this.message('已回到动画控制，t=0。');
   }
@@ -83,6 +128,11 @@ export class Simulator {
   setScenario(scenario: ScenarioId): void {
     this.scenario = scenario;
     this.speed = SCENARIOS[scenario].suggestedSpeed;
+    this.reset();
+  }
+
+  setEnvironment(environment: EnvironmentKind): void {
+    this.environment = environment;
     this.reset();
   }
 
@@ -159,6 +209,29 @@ export class Simulator {
     }
 
     const sample = this.animator.sample(this.time);
+
+    if (this.mode === 'recovering' && this.recovery) {
+      // The get-up drives the dynamic chain itself; the clip only supplies the
+      // final blend target and stays rebased onto the body's current root.
+      this.recovery.step(sample.pose);
+      const state = this.recovery.getState();
+      this.lastMessage = state.message;
+      if (state.status === 'complete') {
+        this.completeRecovery(sample);
+      }
+      this.handoff.stepWorldOnly();
+      this.trace.push({ t: this.time, root: this.handoff.poseFromWorld().pelvis.pos, handoff: false });
+      this.finishRecordingIfDue();
+      return;
+    }
+
+    if (this.mode === 'falling') {
+      // Guided fall steps the world internally; just record the trace.
+      this.trace.push({ t: this.time, root: this.handoff.poseFromWorld().pelvis.pos, handoff: false });
+      this.finishRecordingIfDue();
+      return;
+    }
+
     this.handoff.driveAnimation(sample);
     if (this.mode === 'physics') {
       this.handoff.applyStabilityAssist(sample, this.time - this.handoffAt);
@@ -179,6 +252,10 @@ export class Simulator {
       }
     }
 
+    this.finishRecordingIfDue();
+  }
+
+  private finishRecordingIfDue(): void {
     if (this.recording && this.mode === 'physics' && this.time - this.recording.handoffTime > 1.6) {
       this.finishRecording();
     }
@@ -217,11 +294,116 @@ export class Simulator {
   /** Restore animation control, rebuilding the chain at the clip's current pose. */
   restore(record = false): void {
     this.mode = 'animating';
+    this.recovery = null;
+    this.recoverySnapshot = null;
     this.handoff.restoreAnimation();
+    this.handoff.resetDamping();
     this.handoff.build(this.animator.sample(this.time), this.subset);
     this.handoffAt = -1;
     if (record) this.recordInput('restore');
     this.message('已恢复动画控制。');
+  }
+
+  /**
+   * Guided-fall entry for the contact drill: the current chain is moved through
+   * a deterministic fallen configuration (supine/prone/side) while every frame
+   * runs the collision pipeline, so the contacts the planner reads are real.
+   */
+  fallDown(orientation: Exclude<FallenOrientation, 'upright'>): void {
+    if (this.mode === 'recovering' || this.mode === 'falling') return;
+    const current = this.handoff.poseFromWorld().pelvis.pos;
+    const target = buildFallenPose(this.scenario, orientation, current, 0);
+    this.mode = 'falling';
+    this.recovery = null;
+    this.recoverySnapshot = null;
+    // 36 fixed steps (~0.3 s) of kinematic motion through live collision.
+    this.handoff.guidedFall(target, 36);
+    // Let the body settle dynamically for a short window so manifolds stabilize.
+    this.handoff.beginDynamicRecovery();
+    for (let i = 0; i < 24; i++) this.handoff.stepWorldOnly();
+    // Place wall/ceiling constraints around the settled fallen body. The wall
+    // sits just beyond the actual head position (not a fixed root offset, which
+    // drifts as the chain settles); the ceiling is 0.5 m above the lying pelvis.
+    if (this.environment !== 'clear') {
+      const fallen = this.handoff.poseFromWorld();
+      const anchor =
+        this.environment === 'wall'
+          ? { ...fallen.head.pos, z: fallen.pelvis.pos.z }
+          : fallen.pelvis.pos;
+      this.handoff.setObstacles(ENVIRONMENT_OBSTACLES[this.environment](anchor));
+    }
+    this.mode = 'physics';
+    this.handoffAt = this.time;
+    this.message(`受控倒地完成（${orientation}）：接触与净空已就绪，可启动接触感知恢复。`);
+  }
+
+  /** Analyze the current fallen state without committing to a get-up. */
+  analyzeRecovery() {
+    return planRecovery(this.handoff, this.scenario);
+  }
+
+  /** Start the contact-aware get-up. Returns the plan, including any blocking reason. */
+  beginRecovery() {
+    if (this.mode === 'recovering') return this.recovery!.getPlan();
+    this.recovery = new RecoveryController(this.handoff, this.scenario);
+    const plan = this.recovery.start(() => undefined);
+    if (plan.feasible) {
+      this.mode = 'recovering';
+      this.message(this.recovery.getState().message);
+    } else {
+      this.mode = 'physics';
+      this.message(this.recovery.getState().message);
+    }
+    return plan;
+  }
+
+  /** Re-evaluate a paused/failed recovery against the current scene. */
+  retryRecovery() {
+    if (!this.recovery) return null;
+    const plan = this.recovery.retry();
+    if (plan?.feasible) this.mode = 'recovering';
+    this.message(this.recovery.getState().message);
+    return plan;
+  }
+
+  getRecoveryState(): RecoveryState | null {
+    if (this.recovery) return this.recovery.getState();
+    return this.recoverySnapshot;
+  }
+
+  /**
+   * Final handoff after the blend: rebuild the chain at the clip pose rebased
+   * onto the recovered root, then flip ownership back to animation. No
+   * teleport — the clip root is offset to the body's actual position.
+   */
+  private completeRecovery(sample: AnimSample): void {
+    const current = this.handoff.poseFromWorld();
+    const delta: Vec3 = {
+      x: current.pelvis.pos.x - sample.pose.pelvis.pos.x,
+      y: current.pelvis.pos.y - sample.pose.pelvis.pos.y,
+      z: current.pelvis.pos.z - sample.pose.pelvis.pos.z,
+    };
+    const rebased = {} as Pose;
+    for (const id of BONE_IDS) {
+      rebased[id] = {
+        pos: {
+          x: sample.pose[id].pos.x + delta.x,
+          y: sample.pose[id].pos.y + delta.y,
+          z: sample.pose[id].pos.z + delta.z,
+        },
+        rot: sample.pose[id].rot,
+      };
+    }
+    // build() only consumes `.pose`, but keep the sample shape for the API.
+    const rebasedSample: AnimSample = { ...sample, pose: rebased };
+    this.recoverySnapshot = this.recovery!.getState();
+    this.handoff.restoreAnimation();
+    this.handoff.resetDamping();
+    this.handoff.build(rebasedSample, this.subset);
+    this.mode = 'animating';
+    this.recovery = null;
+    this.handoffAt = -1;
+    this.message('接触感知起身完成：控制已平滑交回动画，根位置沿用实际恢复位置。');
   }
 
   /**

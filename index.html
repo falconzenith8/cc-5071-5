@@ -74,6 +74,30 @@
         </div>
 
         <div class="group">
+          <h2>接触感知恢复</h2>
+          <label class="field-label">倒地方向</label>
+          <div class="seg">
+            <button data-fall="supine" class="active">仰卧</button>
+            <button data-fall="prone">俯卧</button>
+            <button data-fall="side">侧躺</button>
+          </div>
+          <label class="field-label">环境约束</label>
+          <div class="seg">
+            <button data-env="clear" class="active">空旷</button>
+            <button data-env="wall">靠墙</button>
+            <button data-env="ceiling">低顶</button>
+          </div>
+          <div class="btns">
+            <button id="fall">受控倒地</button>
+            <button id="recover" class="primary">接触感知起身</button>
+            <button id="retry-recover">重新评估</button>
+          </div>
+          <div id="recovery-panel" class="recovery-panel">
+            <p class="empty">尚未开始恢复。先「受控倒地」，再「接触感知起身」。</p>
+          </div>
+        </div>
+
+        <div class="group">
           <h2>可重放输入</h2>
           <div class="btns">
             <button id="record">开始录制</button>

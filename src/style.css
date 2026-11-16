@@ -147,3 +147,21 @@ td.bad { color: var(--bad); font-weight: 600; }
   .hud { gap: 12px; }
   .hud-item label { display: none; }
 }
+
+.field-label { display: block; font-size: 11px; color: var(--muted); margin: 10px 0 5px; }
+.recovery-panel {
+  margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel-2); font-size: 11px;
+}
+.recovery-panel.failed { border-color: #7a2e2e; background: rgba(58, 20, 20, 0.35); }
+.recovery-panel.ok { border-color: #2e6a48; background: rgba(20, 58, 38, 0.3); }
+.recovery-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.recovery-panel .badge { padding: 2px 8px; border-radius: 10px; font-size: 10px; border: 1px solid var(--line); }
+.recovery-panel .badge.good { color: var(--good); border-color: #2e6a48; }
+.recovery-panel .badge.bad { color: var(--bad); border-color: #7a2e2e; }
+.basis-list { margin: 0; padding-left: 16px; color: var(--text); line-height: 1.6; }
+.basis-list li { font-size: 10.5px; }
+.clearance-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 10px; }
+.clearance-table th, .clearance-table td { padding: 3px 4px; text-align: right; }
+.clearance-table th:first-child, .clearance-table td:first-child { text-align: left; }
+.clearance-table tr.bad td { color: var(--bad); }
